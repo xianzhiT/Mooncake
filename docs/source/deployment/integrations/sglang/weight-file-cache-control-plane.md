@@ -312,3 +312,14 @@ RDMA buffer.
 This first slice is file-level only. It does not create tensor-level
 checkpoints, and does not yet implement serving leases or a production catalog
 backend. The model index is stored as Mooncake objects for the prototype.
+
+Catalog mutations use a Store-backed global single-writer record at
+`weight/control/catalog-mutation-owner`. Concurrent `import` and `delete`
+commands hold that ownership for their complete data and catalog operations and
+wait for an existing owner for up to 60 seconds. Read commands and serving
+connectors remain concurrent. Hard pinning prevents normal eviction; it does
+not provide durable locking or fencing. If a writer exits and its ownership
+record remains readable, later mutations fail closed. An operator must confirm
+that the old writer has stopped before removing that record. This Phase 1
+mechanism does not provide leases, fencing, or automatic takeover, and a failed
+ownership removal has an unknown outcome that must be handled operationally.

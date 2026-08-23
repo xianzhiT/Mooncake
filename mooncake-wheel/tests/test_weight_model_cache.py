@@ -2,18 +2,29 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from mooncake.weight_store.coordination import (
+    CatalogMutationBusyError,
+    CatalogOwnershipLostError,
+    CatalogOwnershipReleaseUnknownError,
+    MutationOwnership,
+    StoreMutationCoordinator,
+)
 from mooncake.weight_store.model import (
-    ModelFileCacheClient,
-    ModelFileManifest,
     READY,
     SCHEMA_VERSION,
+    ModelFileCacheClient,
+    ModelFileManifest,
 )
 from mooncake.weight_store.model_keyspace import (
+    catalog_mutation_owner_key,
     model_file_chunk_key,
     model_file_key,
+    model_id_index_key,
     model_index_key,
     model_manifest_key,
     validate_checkpoint_id,
@@ -151,6 +162,18 @@ class RecordingStore(FakeStore):
         return super().upsert(key, value, config)
 
 
+class IndexWriteFailStore(FakeStore):
+    def __init__(self, fail_key: str) -> None:
+        super().__init__()
+        self.fail_key = fail_key
+        self.fail_enabled = True
+
+    def upsert(self, key: str, value: bytes, config: FakeReplicateConfig) -> int:
+        if self.fail_enabled and key == self.fail_key:
+            return -1
+        return super().upsert(key, value, config)
+
+
 class MissingObjectRemoveStore(FakeStore):
     """Mimics mooncake native remove: -704 for an already-absent key."""
 
@@ -188,7 +211,6 @@ class ToggleChunkFailStore(FakeStore):
         return super().put(key, value, config)
 
 
-
 class WriteOnceStore(FakeStore):
     """Mimics the native mooncake store: it has NO ``upsert`` at all, and its
     ``put`` is write-once -- a second put to an existing key returns OK (0) but
@@ -217,6 +239,141 @@ class WriteOnceStore(FakeStore):
         self.objects.pop(key, None)
         self.configs.pop(key, None)
         return 0
+
+
+class ConcurrentRaceStore(WriteOnceStore):
+    """Deterministically exposes the two catalog races from the P1 review.
+
+    Events pause one writer at a chosen chunk/manifest boundary while another
+    writer attempts the same Store operation. The test therefore proves the
+    ownership protocol, rather than relying on scheduler timing to happen to
+    reproduce a race.
+    """
+
+    owner_key = catalog_mutation_owner_key()
+
+    def __init__(
+        self,
+        *,
+        same_checkpoint: bool = False,
+        index: bool = False,
+        owner_put_failure: str | None = None,
+        owner_remove_failure: str | None = None,
+    ):
+        super().__init__()
+        self.same_checkpoint = same_checkpoint
+        self.index = index
+        self.owner_put_failure = owner_put_failure
+        self.owner_remove_failure = owner_remove_failure
+        self.lock = threading.RLock()
+        self.roles = threading.local()
+        self.first_chunk_started = threading.Event()
+        self.concurrent_writer_reached = threading.Event()
+        self.owner_contended = threading.Event()
+        self.owner_config: FakeReplicateConfig | None = None
+        self.ready_written = threading.Event()
+        self.index_snapshots = threading.Barrier(2, timeout=5)
+        self.index_barrier_armed = index
+        self.owner_read_mode: str | None = None
+        self.remove_calls: list[str] = []
+
+    def set_role(self, role: str) -> None:
+        self.roles.value = role
+
+    def put(self, key: str, value: bytes, config: FakeReplicateConfig) -> int:
+        role = getattr(self.roles, "value", "")
+        if key == self.owner_key and self.owner_put_failure:
+            if self.owner_put_failure == "exception":
+                raise RuntimeError("ownership put failed")
+            return -1
+        if self.same_checkpoint and role == "A" and "/chunks/" in key:
+            # Keep writer A inside import while writer B reaches ownership
+            # acquisition. Without catalog serialization this is the window in
+            # which B can later publish FAILED over A's READY manifest.
+            self.first_chunk_started.set()
+            if not self.concurrent_writer_reached.wait(timeout=5):
+                raise TimeoutError("concurrent writer did not reach the race point")
+        if self.same_checkpoint and role == "B" and "/chunks/" in key:
+            if not self.ready_written.wait(timeout=5):
+                raise TimeoutError("READY manifest was not published")
+            return -1
+
+        with self.lock:
+            if key == self.owner_key:
+                if key in self.objects:
+                    self.owner_contended.set()
+                    self.concurrent_writer_reached.set()
+                else:
+                    self.owner_config = config
+            if key in self.objects:
+                return 0
+            self.objects[key] = bytes(value)
+            self.configs[key] = config
+
+        if key.endswith("/manifest"):
+            payload = json.loads(bytes(value).decode("utf-8"))
+            if payload.get("status") == READY:
+                self.ready_written.set()
+        return 0
+
+    def get(self, key: str) -> bytes | None:
+        role = getattr(self.roles, "value", "")
+        if self.same_checkpoint and role == "B" and key.endswith("/manifest"):
+            with self.lock:
+                if self.owner_key not in self.objects:
+                    self.concurrent_writer_reached.set()
+        if key == self.owner_key:
+            if self.owner_read_mode == "none":
+                return None
+            if self.owner_read_mode == "error":
+                raise RuntimeError("ownership read failed")
+            if self.owner_read_mode == "invalid":
+                return b"{not-json"
+        wait_for_snapshot = False
+        with self.lock:
+            value = self.objects.get(key)
+            if self.index and key == model_index_key() and self.index_barrier_armed:
+                # Without ownership, force both writers to read the same index
+                # snapshot before either writes it back, reproducing the lost
+                # update deterministically. With ownership, this path disarms.
+                if self.owner_key in self.objects:
+                    self.index_barrier_armed = False
+                else:
+                    wait_for_snapshot = True
+                    snapshot = value
+        if wait_for_snapshot:
+            generation = self.index_snapshots.wait(timeout=5)
+            if generation == 0:
+                with self.lock:
+                    self.index_barrier_armed = False
+            return snapshot
+        return value
+
+    def remove(self, key: str, force: bool = False) -> int:
+        if key == self.owner_key and self.owner_remove_failure:
+            if self.owner_remove_failure == "exception":
+                raise RuntimeError("ownership remove failed")
+            return -1
+        self.remove_calls.append(key)
+        with self.lock:
+            if key not in self.objects:
+                return -704
+            self.objects.pop(key, None)
+            self.configs.pop(key, None)
+        return 0
+
+    def is_exist(self, key: str) -> int:
+        role = getattr(self.roles, "value", "")
+        with self.lock:
+            exists = key in self.objects
+            if (
+                self.same_checkpoint
+                and role == "B"
+                and key.endswith("/manifest")
+                and self.owner_key not in self.objects
+            ):
+                self.concurrent_writer_reached.set()
+        return int(exists)
 
 
 class WriteOnceManifestRemoveFailingStore(WriteOnceStore):
@@ -275,6 +432,140 @@ def write_demo_model(root: Path) -> None:
 
 
 class TestModelFileCacheClient(unittest.TestCase):
+    def test_catalog_ownership_uses_write_once_hard_pinned_metadata(self) -> None:
+        store = ConcurrentRaceStore()
+        self.assertFalse(hasattr(store, "upsert"))
+        client = ModelFileCacheClient(store)
+
+        client.delete_model("missing-checkpoint")
+
+        self.assertEqual(client._mutation_coordinator.wait_timeout_seconds, 60.0)
+        self.assertEqual(client._mutation_coordinator.poll_interval_seconds, 0.1)
+        self.assertEqual(store.owner_key, "weight/control/catalog-mutation-owner")
+        self.assertIsNotNone(store.owner_config)
+        assert store.owner_config is not None
+        self.assertTrue(store.owner_config.with_hard_pin)
+        self.assertEqual(store.owner_config.data_type, FakeObjectDataType.METADATA)
+        self.assertIn(store.owner_key, store.remove_calls)
+        self.assertNotIn(store.owner_key, store.objects)
+
+    def test_ownership_release_failure_reports_unknown_outcome(self) -> None:
+        for mode in ("result", "exception"):
+            with self.subTest(mode=mode):
+                store = ConcurrentRaceStore(owner_remove_failure=mode)
+                config = FakeReplicateConfig()
+                coordinator = StoreMutationCoordinator(store, config)
+
+                with self.assertRaisesRegex(
+                    CatalogOwnershipReleaseUnknownError,
+                    "outcome is unknown",
+                ), coordinator.mutation("import", "demo-main"):
+                    pass
+
+    def test_ownership_write_failures_fail_closed(self) -> None:
+        for mode in ("result", "exception"):
+            with self.subTest(mode=mode):
+                store = ConcurrentRaceStore(owner_put_failure=mode)
+                coordinator = StoreMutationCoordinator(
+                    store,
+                    FakeReplicateConfig(),
+                    wait_timeout_seconds=0.01,
+                    poll_interval_seconds=0.001,
+                )
+
+                with (
+                    self.assertRaises(CatalogMutationBusyError),
+                    coordinator.mutation("import", "demo-main"),
+                ):
+                    self.fail("failed ownership Put must fail closed")
+                self.assertEqual(store.remove_calls, [])
+
+    def test_stale_ownership_is_not_overwritten(self) -> None:
+        store = ConcurrentRaceStore()
+        stale = MutationOwnership(
+            token="stale-token",
+            operation="import",
+            checkpoint_id="stale-checkpoint",
+            hostname="stale-host",
+            pid=123,
+            started_at=1,
+        )
+        config = FakeReplicateConfig()
+        config.with_hard_pin = True
+        store.objects[store.owner_key] = stale.to_json_bytes()
+        store.configs[store.owner_key] = config
+        coordinator = StoreMutationCoordinator(
+            store,
+            config,
+            wait_timeout_seconds=0.01,
+            poll_interval_seconds=0.001,
+        )
+
+        with (
+            self.assertRaises(CatalogMutationBusyError),
+            coordinator.mutation("delete", "new-checkpoint"),
+        ):
+            self.fail("stale ownership must fail closed")
+
+        self.assertEqual(store.objects[store.owner_key], stale.to_json_bytes())
+        self.assertEqual(store.remove_calls, [])
+
+    def test_ownership_token_change_prevents_release(self) -> None:
+        store = ConcurrentRaceStore()
+        config = FakeReplicateConfig()
+        config.with_hard_pin = True
+        coordinator = StoreMutationCoordinator(store, config)
+        replacement = MutationOwnership(
+            token="replacement-token",
+            operation="delete",
+            checkpoint_id="replacement-checkpoint",
+            hostname="replacement-host",
+            pid=456,
+            started_at=2,
+        )
+
+        with (
+            self.assertRaises(CatalogOwnershipLostError),
+            coordinator.mutation("import", "demo-main"),
+            store.lock,
+        ):
+            store.objects[store.owner_key] = replacement.to_json_bytes()
+
+        self.assertEqual(store.objects[store.owner_key], replacement.to_json_bytes())
+        self.assertEqual(store.remove_calls, [])
+
+    def test_ownership_read_failures_fail_closed(self) -> None:
+        for mode in ("none", "error", "invalid"):
+            with self.subTest(phase="acquire", mode=mode):
+                store = ConcurrentRaceStore()
+                config = FakeReplicateConfig()
+                store.owner_read_mode = mode
+                coordinator = StoreMutationCoordinator(
+                    store,
+                    config,
+                    wait_timeout_seconds=0.01,
+                    poll_interval_seconds=0.001,
+                )
+
+                with (
+                    self.assertRaises(CatalogMutationBusyError),
+                    coordinator.mutation("import", "demo-main"),
+                ):
+                    self.fail("unreadable ownership must fail closed")
+                self.assertEqual(store.remove_calls, [])
+
+            with self.subTest(phase="release", mode=mode):
+                store = ConcurrentRaceStore()
+                config = FakeReplicateConfig()
+                coordinator = StoreMutationCoordinator(store, config)
+
+                with (
+                    self.assertRaises(CatalogOwnershipLostError),
+                    coordinator.mutation("import", "demo-main"),
+                ):
+                    store.owner_read_mode = mode
+                self.assertEqual(store.remove_calls, [])
+
     def test_import_model_writes_file_manifest_weight_metadata_and_index(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp)
@@ -296,6 +587,7 @@ class TestModelFileCacheClient(unittest.TestCase):
         self.assertIn(model_manifest_key("demo-main"), store.objects)
         self.assertIn("demo-main", client.list_models())
         self.assertEqual(client.inspect_model("demo-main"), manifest)
+        self.assertNotIn(catalog_mutation_owner_key(), store.objects)
 
         by_path = {record.path: record for record in manifest.files}
         weight_record = by_path["model-00001-of-00002.safetensors"]
@@ -440,6 +732,7 @@ class TestModelFileCacheClient(unittest.TestCase):
             failed = client.inspect_model("demo-main")
             self.assertEqual(failed.status, "FAILED")
             self.assertIn("failed to put", failed.error or "")
+            self.assertNotIn(catalog_mutation_owner_key(), store.objects)
 
     def test_import_interrupt_writes_failed_manifest_and_removes_partial_chunks(
         self,
@@ -464,6 +757,7 @@ class TestModelFileCacheClient(unittest.TestCase):
             self.assertFalse(
                 any(key.endswith("/chunks/00000000") for key in store.objects)
             )
+            self.assertNotIn(catalog_mutation_owner_key(), store.objects)
 
     def test_import_cleanup_attempts_all_chunks_after_remove_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -653,6 +947,8 @@ class TestModelFileCacheClient(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 client.delete_model("demo-main")
 
+            self.assertNotIn(catalog_mutation_owner_key(), store.objects)
+
             for record in manifest.files:
                 for chunk in record.chunks:
                     self.assertNotIn(chunk, store.objects)
@@ -740,6 +1036,149 @@ class TestModelFileCacheClient(unittest.TestCase):
                     source_uri=str(source),
                 )
             self.assertIn("demo-main", str(ctx.exception))
+
+    def test_concurrent_same_checkpoint_failure_does_not_replace_ready_manifest(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp)
+            write_demo_model(source)
+            store = ConcurrentRaceStore(same_checkpoint=True)
+            client_a = ModelFileCacheClient(store, file_chunk_size=4)
+            client_b = ModelFileCacheClient(store, file_chunk_size=4)
+
+            def import_as(role: str, client: ModelFileCacheClient):
+                store.set_role(role)
+                return client.import_model(
+                    checkpoint_id="demo-main",
+                    model_id="demo/model",
+                    revision="main",
+                    source_uri=str(source),
+                )
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                future_a = executor.submit(import_as, "A", client_a)
+                self.assertTrue(store.first_chunk_started.wait(timeout=5))
+                future_b = executor.submit(import_as, "B", client_b)
+                self.assertTrue(store.concurrent_writer_reached.wait(timeout=5))
+                self.assertEqual(future_a.result(timeout=5).status, READY)
+                with self.assertRaises(ValueError):
+                    future_b.result(timeout=5)
+
+            self.assertEqual(client_a.inspect_model("demo-main").status, READY)
+            self.assertEqual(client_a.verify_model("demo-main").status, READY)
+
+    def test_import_and_delete_share_the_same_catalog_ownership(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp)
+            write_demo_model(source)
+            store = ConcurrentRaceStore(same_checkpoint=True)
+            importer = ModelFileCacheClient(store, file_chunk_size=4)
+            deleter = ModelFileCacheClient(store, file_chunk_size=4)
+
+            def import_model():
+                store.set_role("A")
+                return importer.import_model(
+                    checkpoint_id="demo-main",
+                    model_id="demo/model",
+                    revision="main",
+                    source_uri=str(source),
+                )
+
+            def delete_model():
+                store.set_role("B")
+                return deleter.delete_model("demo-main")
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                import_future = executor.submit(import_model)
+                self.assertTrue(store.first_chunk_started.wait(timeout=5))
+                delete_future = executor.submit(delete_model)
+                self.assertTrue(store.concurrent_writer_reached.wait(timeout=5))
+                self.assertEqual(import_future.result(timeout=5).status, READY)
+                self.assertIsNone(delete_future.result(timeout=5))
+
+            self.assertEqual(importer.list_models(), [])
+            with self.assertRaises(KeyError):
+                importer.inspect_model("demo-main")
+
+    def test_concurrent_imports_do_not_lose_ready_checkpoint_from_global_index(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp)
+            write_demo_model(source)
+            store = ConcurrentRaceStore(index=True)
+            store.objects[model_index_key()] = b"[]"
+            store.configs[model_index_key()] = FakeReplicateConfig()
+            client_a = ModelFileCacheClient(store, file_chunk_size=4)
+            client_b = ModelFileCacheClient(store, file_chunk_size=4)
+
+            def import_checkpoint(checkpoint_id: str, client: ModelFileCacheClient):
+                return client.import_model(
+                    checkpoint_id=checkpoint_id,
+                    model_id="demo/model",
+                    revision="main",
+                    source_uri=str(source),
+                )
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                future_a = executor.submit(import_checkpoint, "ckpt-a", client_a)
+                future_b = executor.submit(import_checkpoint, "ckpt-b", client_b)
+                self.assertEqual(future_a.result(timeout=5).status, READY)
+                self.assertEqual(future_b.result(timeout=5).status, READY)
+
+            self.assertEqual(client_a.list_models(), ["ckpt-a", "ckpt-b"])
+            per_model = json.loads(
+                store.objects[model_id_index_key("demo/model")].decode("utf-8")
+            )
+            self.assertEqual(per_model, ["ckpt-a", "ckpt-b"])
+
+    def test_ready_manifest_survives_failure_before_global_index_and_retry_repairs(
+        self,
+    ) -> None:
+        self._assert_ready_manifest_survives_index_failure(model_index_key())
+
+    def test_ready_manifest_survives_failure_between_indexes_and_retry_repairs(
+        self,
+    ) -> None:
+        self._assert_ready_manifest_survives_index_failure(
+            model_id_index_key("demo/model")
+        )
+
+    def _assert_ready_manifest_survives_index_failure(self, fail_key: str) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp)
+            write_demo_model(source)
+            store = IndexWriteFailStore(fail_key)
+            client = ModelFileCacheClient(store, file_chunk_size=4)
+
+            with self.assertRaises(RuntimeError):
+                client.import_model(
+                    checkpoint_id="demo-main",
+                    model_id="demo/model",
+                    revision="main",
+                    source_uri=str(source),
+                )
+
+            self.assertEqual(client.inspect_model("demo-main").status, READY)
+
+            store.fail_enabled = False
+            with self.assertRaises(ValueError):
+                client.import_model(
+                    checkpoint_id="demo-main",
+                    model_id="wrong/model",
+                    revision="wrong-revision",
+                    source_uri=str(source),
+                )
+
+            self.assertEqual(client.inspect_model("demo-main").status, READY)
+            self.assertEqual(client.verify_model("demo-main").status, READY)
+            self.assertEqual(client.list_models(), ["demo-main"])
+            per_model = json.loads(
+                store.objects[model_id_index_key("demo/model")].decode("utf-8")
+            )
+            self.assertEqual(per_model, ["demo-main"])
+            self.assertNotIn(model_id_index_key("wrong/model"), store.objects)
 
     # ------------------------------------------------------------------
     # Blocker: the native store is write-once and has no ``upsert``.
