@@ -242,7 +242,13 @@ class WriteOnceStore(FakeStore):
 
 
 class ConcurrentRaceStore(WriteOnceStore):
-    """Deterministically exposes the two catalog races from the P1 review."""
+    """Deterministically exposes the two catalog races from the P1 review.
+
+    Events pause one writer at a chosen chunk/manifest boundary while another
+    writer attempts the same Store operation. The test therefore proves the
+    ownership protocol, rather than relying on scheduler timing to happen to
+    reproduce a race.
+    """
 
     owner_key = catalog_mutation_owner_key()
 
@@ -281,6 +287,9 @@ class ConcurrentRaceStore(WriteOnceStore):
                 raise RuntimeError("ownership put failed")
             return -1
         if self.same_checkpoint and role == "A" and "/chunks/" in key:
+            # Keep writer A inside import while writer B reaches ownership
+            # acquisition. Without catalog serialization this is the window in
+            # which B can later publish FAILED over A's READY manifest.
             self.first_chunk_started.set()
             if not self.concurrent_writer_reached.wait(timeout=5):
                 raise TimeoutError("concurrent writer did not reach the race point")
@@ -324,6 +333,9 @@ class ConcurrentRaceStore(WriteOnceStore):
         with self.lock:
             value = self.objects.get(key)
             if self.index and key == model_index_key() and self.index_barrier_armed:
+                # Without ownership, force both writers to read the same index
+                # snapshot before either writes it back, reproducing the lost
+                # update deterministically. With ownership, this path disarms.
                 if self.owner_key in self.objects:
                     self.index_barrier_armed = False
                 else:

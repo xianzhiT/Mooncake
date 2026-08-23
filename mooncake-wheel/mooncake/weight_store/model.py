@@ -116,6 +116,9 @@ class ModelFileCacheClient:
         self.file_chunk_size = file_chunk_size
         self.progress = progress
         self.file_key = model_file_key
+        # Only import/delete use this coordinator. Read-only inspection,
+        # verification, materialization, and serving connectors remain
+        # concurrent because they do not mutate the catalog.
         self._mutation_coordinator = StoreMutationCoordinator(
             store,
             self._new_config("METADATA", hard_pin=True),
@@ -130,6 +133,9 @@ class ModelFileCacheClient:
         source_uri: str,
     ) -> ModelFileManifest:
         validate_checkpoint_id(checkpoint_id)
+        # Hold ownership across both data writes and catalog publication. A
+        # narrower lock around only the manifest/index would still allow a
+        # concurrent delete or re-import to race with chunk upload and cleanup.
         with self._mutation_coordinator.mutation("import", checkpoint_id):
             return self._import_model_unlocked(
                 checkpoint_id=checkpoint_id,
@@ -159,6 +165,9 @@ class ModelFileCacheClient:
             except (KeyError, ValueError):
                 existing = None
             if existing is not None and existing.status == READY:
+                # READY is immutable. Repair a missing index entry left by an
+                # earlier post-publication failure, then reject the re-import;
+                # never replace stable model state with this attempt's failure.
                 self._add_to_indexes(existing)
                 raise ValueError(f"model checkpoint already exists: {checkpoint_id}")
             self._delete_model_unlocked(checkpoint_id)
@@ -173,6 +182,8 @@ class ModelFileCacheClient:
         total_bytes = sum(path.stat().st_size for path in files)
         imported_bytes = 0
         import_started_at = time.time()
+        # Once READY is published it is the stable commit point. Later index
+        # failures must propagate without writing FAILED over that manifest.
         ready_published = False
         try:
             for index, path in enumerate(files, start=1):
@@ -272,6 +283,9 @@ class ModelFileCacheClient:
         except BaseException as exc:
             if ready_published:
                 raise
+            # The flag covers this process's normal publication path. The
+            # read-back also protects against an already-visible READY manifest
+            # if Store accepted a concurrent/ambiguous write outcome.
             try:
                 published = self._read_manifest(checkpoint_id)
             except (KeyError, ValueError):
@@ -337,6 +351,8 @@ class ModelFileCacheClient:
         return manifest
 
     def delete_model(self, checkpoint_id: str) -> None:
+        # Delete shares the same ownership as import so the two multi-key
+        # operations cannot interleave chunks, indexes, and manifests.
         with self._mutation_coordinator.mutation("delete", checkpoint_id):
             self._delete_model_unlocked(checkpoint_id)
 
@@ -350,7 +366,7 @@ class ModelFileCacheClient:
             # manifest). Treat as an idempotent no-op success.
             return
         except ValueError:
-            # Manifest is present but unparseable (corrupt/non-JSON), so we
+            # Manifest is present but unparsable (corrupt/non-JSON), so we
             # cannot recover model_id to de-index. Best-effort drop the dangling
             # manifest key so the checkpoint id is no longer stuck, then return.
             self._remove(model_manifest_key(checkpoint_id), force=True)

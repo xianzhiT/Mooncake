@@ -35,6 +35,8 @@ def model_id_index_key(model_id: str) -> str:
 
 
 def catalog_mutation_owner_key() -> str:
+    """Return the single global key used to serialize Phase 1 catalog writes."""
+
     return "weight/control/catalog-mutation-owner"
 
 
