@@ -34,6 +34,10 @@ def model_id_index_key(model_id: str) -> str:
     return f"weight/index/model/{_sha256_text(model_id)}"
 
 
+def catalog_mutation_owner_key() -> str:
+    return "weight/control/catalog-mutation-owner"
+
+
 def validate_checkpoint_id(checkpoint_id: str) -> None:
     _validate_id("checkpoint_id", checkpoint_id)
 

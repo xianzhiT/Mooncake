@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .coordination import StoreMutationCoordinator
 from .model_keyspace import (
     model_file_chunk_key,
     model_file_key,
@@ -115,6 +116,10 @@ class ModelFileCacheClient:
         self.file_chunk_size = file_chunk_size
         self.progress = progress
         self.file_key = model_file_key
+        self._mutation_coordinator = StoreMutationCoordinator(
+            store,
+            self._new_config("METADATA", hard_pin=True),
+        )
 
     def import_model(
         self,
@@ -125,6 +130,22 @@ class ModelFileCacheClient:
         source_uri: str,
     ) -> ModelFileManifest:
         validate_checkpoint_id(checkpoint_id)
+        with self._mutation_coordinator.mutation("import", checkpoint_id):
+            return self._import_model_unlocked(
+                checkpoint_id=checkpoint_id,
+                model_id=model_id,
+                revision=revision,
+                source_uri=source_uri,
+            )
+
+    def _import_model_unlocked(
+        self,
+        *,
+        checkpoint_id: str,
+        model_id: str,
+        revision: str,
+        source_uri: str,
+    ) -> ModelFileManifest:
         source = Path(source_uri)
         if not source.is_dir():
             raise ValueError(f"source_uri must be a directory: {source_uri}")
@@ -138,10 +159,9 @@ class ModelFileCacheClient:
             except (KeyError, ValueError):
                 existing = None
             if existing is not None and existing.status == READY:
-                raise ValueError(
-                    f"model checkpoint already exists: {checkpoint_id}"
-                )
-            self.delete_model(checkpoint_id)
+                self._add_to_indexes(existing)
+                raise ValueError(f"model checkpoint already exists: {checkpoint_id}")
+            self._delete_model_unlocked(checkpoint_id)
 
         files = _list_model_files(source)
         if not files:
@@ -153,6 +173,7 @@ class ModelFileCacheClient:
         total_bytes = sum(path.stat().st_size for path in files)
         imported_bytes = 0
         import_started_at = time.time()
+        ready_published = False
         try:
             for index, path in enumerate(files, start=1):
                 rel = path.relative_to(source).as_posix()
@@ -245,9 +266,18 @@ class ModelFileCacheClient:
             # Publish: one manifest write (first write on an empty key), then
             # index.
             self._write_manifest(manifest)
+            ready_published = True
             self._add_to_indexes(manifest)
             return manifest
         except BaseException as exc:
+            if ready_published:
+                raise
+            try:
+                published = self._read_manifest(checkpoint_id)
+            except (KeyError, ValueError):
+                published = None
+            if published is not None and published.status == READY:
+                raise
             failed = ModelFileManifest(
                 checkpoint_id=checkpoint_id,
                 model_id=model_id,
@@ -307,6 +337,10 @@ class ModelFileCacheClient:
         return manifest
 
     def delete_model(self, checkpoint_id: str) -> None:
+        with self._mutation_coordinator.mutation("delete", checkpoint_id):
+            self._delete_model_unlocked(checkpoint_id)
+
+    def _delete_model_unlocked(self, checkpoint_id: str) -> None:
         # Delete is a multi-key operation over a store with no transactions, so
         # it must be safe to crash after any step and re-run to completion.
         try:
