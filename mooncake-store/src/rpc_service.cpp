@@ -269,6 +269,31 @@ WrappedMasterService::GetReplicaListByRegex(const std::string& str,
         });
 }
 
+tl::expected<std::vector<std::string>, ErrorCode>
+WrappedMasterService::GetKeysByRegex(const std::string& str,
+                                     const std::string& tenant_id) {
+    return execute_rpc(
+        "GetKeysByRegex",
+        [&] {
+            return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
+                                         ? std::string_view(tenant_id)
+                                         : TenantId::kDefaultValue,
+                                     [&](const TenantId& resolved_tenant_id) {
+                                         return master_service_.GetKeysByRegex(
+                                             str, resolved_tenant_id);
+                                     });
+        },
+        [&](auto& timer) { timer.LogRequest("Regex=", str); },
+        [] {
+            MasterMetricManager::instance()
+                .inc_get_replica_list_by_regex_requests();
+        },
+        [] {
+            MasterMetricManager::instance()
+                .inc_get_replica_list_by_regex_failures();
+        });
+}
+
 tl::expected<GetReplicaListResponse, ErrorCode>
 WrappedMasterService::GetReplicaList(const std::string& key,
                                      const std::string& tenant_id) {
@@ -1765,6 +1790,8 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::GetReplicaListByRegex>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::GetKeysByRegex>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetReplicaList>(
         &wrapped_master_service);

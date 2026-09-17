@@ -62,6 +62,9 @@ class WrappedMasterService {
     GetReplicaListByRegex(const std::string& str,
                           const std::string& tenant_id = "default");
 
+    tl::expected<std::vector<std::string>, ErrorCode> GetKeysByRegex(
+        const std::string& str, const std::string& tenant_id = "default");
+
     tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
         const std::string& key, const std::string& tenant_id = "default");
 

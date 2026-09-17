@@ -2525,6 +2525,18 @@ PYBIND11_MODULE(store, m) {
             "regular expression. If force=True, skip lease and replication "
             "task checks.")
         .def(
+            "query_keys_by_regex",
+            [](MooncakeStorePyWrapper &self, const std::string &str) {
+                py::gil_scoped_release release;
+                return self.store_->queryKeysByRegex(str);
+            },
+            py::arg("regex_pattern"),
+            "Returns the keys of objects in the store matching the given "
+            "regular expression. Server-side filtering, so only matching keys "
+            "cross the wire. Returns an empty list on error. Note this scans "
+            "all metadata shards (O(total keys)) and is intended for "
+            "management/listing commands, not hot paths.")
+        .def(
             "remove_all",
             [](MooncakeStorePyWrapper &self, bool force) {
                 py::gil_scoped_release release;

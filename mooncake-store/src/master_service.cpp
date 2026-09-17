@@ -3306,6 +3306,42 @@ auto MasterService::GetAllKeys(const TenantId& tenant_id)
     return all_keys;
 }
 
+auto MasterService::GetKeysByRegex(const std::string& regex_pattern,
+                                   const TenantId& tenant_id)
+    -> tl::expected<std::vector<std::string>, ErrorCode> {
+    std::regex pattern;
+    try {
+        pattern = std::regex(regex_pattern, std::regex::ECMAScript);
+    } catch (const std::regex_error& e) {
+        LOG(ERROR) << "Invalid regex pattern: " << regex_pattern
+                   << ", error: " << e.what();
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::vector<std::string> keys;
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
+    for (size_t i = 0; i < kNumShards; i++) {
+        MetadataShardAccessorRO shard(this, i);
+        auto tenant_it = shard->tenants.find(normalized_tenant);
+        if (tenant_it == shard->tenants.end()) {
+            continue;
+        }
+        for (const auto& item : tenant_it->second.metadata) {
+            if (!HasReadableReplica(item.second)) {
+                continue;
+            }
+            const std::string& key = item.second.user_key.empty()
+                                         ? item.first
+                                         : item.second.user_key;
+            if (std::regex_search(key, pattern)) {
+                keys.push_back(key);
+            }
+        }
+    }
+    return keys;
+}
+
 auto MasterService::GetAllSegments()
     -> tl::expected<std::vector<std::string>, ErrorCode> {
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();

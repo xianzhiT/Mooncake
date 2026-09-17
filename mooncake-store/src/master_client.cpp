@@ -58,6 +58,11 @@ struct RpcNameTraits<&WrappedMasterService::GetReplicaListByRegex> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::GetKeysByRegex> {
+    static constexpr const char* value = "GetKeysByRegex";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::BatchGetReplicaList> {
     static constexpr const char* value = "BatchGetReplicaList";
 };
@@ -585,6 +590,18 @@ MasterClient::GetReplicaListByRegex(const std::string& str) {
         &WrappedMasterService::GetReplicaListByRegex,
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>>(
         str, tenant_id_.value());
+
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<std::vector<std::string>, ErrorCode> MasterClient::GetKeysByRegex(
+    const std::string& str) {
+    ScopedVLogTimer timer(1, "MasterClient::GetKeysByRegex");
+    timer.LogRequest("Regex=", str);
+
+    auto result = invoke_rpc<&WrappedMasterService::GetKeysByRegex,
+                             std::vector<std::string>>(str, tenant_id_.value());
 
     timer.LogResponseExpected(result);
     return result;

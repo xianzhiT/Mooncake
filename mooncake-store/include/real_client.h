@@ -351,6 +351,8 @@ class RealClient : public PyClient {
 
     long removeByRegex(const std::string &str, bool force = false);
 
+    std::vector<std::string> queryKeysByRegex(const std::string &str);
+
     long removeAll(bool force = false);
 
     std::vector<int> batchRemove(const std::vector<std::string> &keys,
@@ -764,6 +766,9 @@ class RealClient : public PyClient {
 
     tl::expected<long, ErrorCode> removeByRegex_internal(const std::string &str,
                                                          bool force = false);
+
+    tl::expected<std::vector<std::string>, ErrorCode> queryKeysByRegex_internal(
+        const std::string &str);
 
     tl::expected<int64_t, ErrorCode> removeAll_internal(bool force = false);
 

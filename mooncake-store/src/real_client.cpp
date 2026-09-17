@@ -2395,6 +2395,23 @@ long RealClient::removeByRegex(const std::string &str, bool force) {
     return to_py_ret(removeByRegex_internal(str, force));
 }
 
+tl::expected<std::vector<std::string>, ErrorCode>
+RealClient::queryKeysByRegex_internal(const std::string &str) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return client_->QueryKeysByRegex(str);
+}
+
+std::vector<std::string> RealClient::queryKeysByRegex(const std::string &str) {
+    auto result = queryKeysByRegex_internal(str);
+    if (!result) {
+        return {};
+    }
+    return std::move(result.value());
+}
+
 tl::expected<int64_t, ErrorCode> RealClient::removeAll_internal(bool force) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";

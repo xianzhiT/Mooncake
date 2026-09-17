@@ -251,6 +251,21 @@ class MasterService {
         -> tl::expected<std::vector<std::string>, ErrorCode>;
 
     /**
+     * @brief Fetch the keys of a single tenant that match a regex pattern.
+     *
+     * Server-side counterpart of GetAllKeys for callers that only need the
+     * matching key names, not their replica descriptors. Unlike
+     * GetReplicaListByRegex this does not grant a read lease, since listing an
+     * object is not using it.
+     *
+     * @param regex_pattern ECMAScript regex matched against object keys.
+     * @return The matching keys on success, or an ErrorCode on failure.
+     */
+    auto GetKeysByRegex(const std::string& regex_pattern,
+                        const TenantId& tenant_id)
+        -> tl::expected<std::vector<std::string>, ErrorCode>;
+
+    /**
      * @brief Fetch all segments, each node has a unique real client with fixed
      * segment name : segment name, preferred format : {ip}:{port}, bad format :
      * localhost:{port}

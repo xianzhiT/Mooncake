@@ -398,6 +398,13 @@ class PyClient {
 
     virtual long removeByRegex(const std::string &str, bool force = false) = 0;
 
+    /**
+     * @brief Query the keys matching a regex pattern.
+     * @return Matching keys, or an empty vector on error.
+     */
+    virtual std::vector<std::string> queryKeysByRegex(
+        const std::string &str) = 0;
+
     virtual long removeAll(bool force = false) = 0;
 
     virtual std::vector<int> batchRemove(const std::vector<std::string> &keys,

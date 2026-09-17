@@ -152,6 +152,14 @@ class Client {
     QueryByRegex(const std::string& str);
 
     /**
+     * @brief Query the keys matching a regex pattern, without replica info.
+     * @param str The regular expression string to match against object keys.
+     * @return The matching keys on success, or an ErrorCode on failure.
+     */
+    tl::expected<std::vector<std::string>, ErrorCode> QueryKeysByRegex(
+        const std::string& str);
+
+    /**
      * @brief Batch query object metadata without transferring data
      * @param object_keys Keys to query
      * @return Vector of QueryResult objects containing replicas and lease

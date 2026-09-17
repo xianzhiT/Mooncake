@@ -197,6 +197,14 @@ class MasterClient {
     GetReplicaListByRegex(const std::string& str);
 
     /**
+     * @brief Gets the keys matching a regex pattern, without replica info.
+     * @param str The regular expression string to match against object keys.
+     * @return The matching keys on success, or an ErrorCode on failure.
+     */
+    [[nodiscard]] tl::expected<std::vector<std::string>, ErrorCode>
+    GetKeysByRegex(const std::string& str);
+
+    /**
      * @brief Gets object metadata without transferring data
      * @param object_keys Keys to query
      * @param object_infos Output parameter for object metadata

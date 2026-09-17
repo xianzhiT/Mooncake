@@ -1274,6 +1274,15 @@ long DummyClient::removeByRegex(const std::string& str, bool force) {
         invoke_rpc<&RealClient::removeByRegex_internal, long>(str, force));
 }
 
+std::vector<std::string> DummyClient::queryKeysByRegex(const std::string& str) {
+    auto result = invoke_rpc<&RealClient::queryKeysByRegex_internal,
+                             std::vector<std::string>>(str);
+    if (!result) {
+        return {};
+    }
+    return std::move(result.value());
+}
+
 long DummyClient::removeAll(bool force) {
     return to_py_ret(
         invoke_rpc<&RealClient::removeAll_internal, int64_t>(force));
