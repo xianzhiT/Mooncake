@@ -1408,6 +1408,45 @@ if count >= 0:
 
 ---
 
+#### query_keys_by_regex()
+List the keys of objects whose names match a regular expression, without
+fetching their data or replica locations.
+
+```python
+def query_keys_by_regex(self, regex_pattern: str) -> list[str]
+```
+
+**Parameters:**
+- `regex_pattern` (str): The regular expression to match against object keys.
+
+**Returns:**
+- `list[str]`: The matching keys. An empty list if nothing matched, and also
+  an empty list on error (including an invalid pattern).
+
+**Notes:**
+- Filtering happens on the master, so only matching keys cross the wire —
+  unlike the `/get_all_keys` admin endpoint, which returns every key.
+- Listing a key does **not** grant it a read lease; unlike a `get`, it does not
+  extend the object's lifetime.
+- Complexity is O(total keys in the store). Object metadata lives in
+  hash-sharded maps, so keys sharing a prefix are spread across all shards and
+  a full scan cannot be avoided. Use this for management and listing commands,
+  not on hot paths. To check whether specific keys exist, use
+  `batch_is_exist()`, which looks them up directly.
+
+**Example:**
+```python
+# List one well-known file per model to enumerate stored models
+keys = store.query_keys_by_regex(r"^weight/models/[^/]+/files/config\.json$")
+models = [key.split("/")[2] for key in keys]
+
+# Check whether anything is already stored under a prefix
+if store.query_keys_by_regex(r"^weight/models/my-model/"):
+    print("prefix is not empty")
+```
+
+---
+
 #### remove_all()
 Remove all objects from the storage system.
 

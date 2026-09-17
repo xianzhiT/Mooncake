@@ -418,6 +418,77 @@ TEST(MasterServiceTest, GetReplicaListByRegexComplex) {
         .Then(MatchingKeys(".*absolutely_non_existent.*").HasCount(0));
 }
 
+TEST(MasterServiceTest, GetKeysByRegex) {
+    MasterScenario scenario("get keys by regex returns matching key names");
+    scenario.Given(MemoryNode("memory"))
+        .Given(Objects(0, 10)
+                   .NamedBy([](size_t index) {
+                       return "test_key" + std::to_string(index);
+                   })
+                   .Size(1_KB)
+                   .CompleteOn("memory"))
+        .Then(MatchingKeyNames("^test_key").HasCount(10))
+        .Then(
+            MatchingKeyNames("^test_key0$").HasCount(1).HasKeys({"test_key0"}))
+        .Then(MatchingKeyNames("^no_such_prefix_").HasCount(0));
+}
+
+TEST(MasterServiceTest, GetKeysByRegexComplex) {
+    MasterScenario("get keys by regex handles complex patterns")
+        .Given(MemoryNode("memory"))
+        .Given(
+            Objects({"test_key_01", "test_key_02", "test_key_10",
+                     "prod_key_alpha", "prod_key_beta", "data_part_1_chunk_a",
+                     "data_part_2_chunk_b", "config/user/settings.json",
+                     "logs/app-2025-08-13.log", "short",
+                     "a_very_very_very_long_key_that_tests_length_limits",
+                     "test-key-extra", "another_key"})
+                .Size(1_KB)
+                .CompleteOn("memory"))
+        .Then(MatchingKeyNames("^test_key_").HasCount(3))
+        .Then(MatchingKeyNames("^test_key_\\d+$").HasCount(3))
+        .Then(MatchingKeyNames("^data_part_\\d_chunk_.$").HasCount(2))
+        .Then(MatchingKeyNames("key").HasCount(8))
+        .Then(MatchingKeyNames("\\.log$").HasCount(1).HasKeys(
+            {"logs/app-2025-08-13.log"}))
+        .Then(MatchingKeyNames("^prod|\\.json$").HasCount(3))
+        .Then(MatchingKeyNames("^non_existent_prefix_").HasCount(0))
+        .Then(MatchingKeyNames("^short$").HasCount(1).HasKeys({"short"}))
+        .Then(MatchingKeyNames(".*absolutely_non_existent.*").HasCount(0));
+}
+
+TEST(MasterServiceTest, GetKeysByRegexRejectsInvalidPattern) {
+    MasterScenario("get keys by regex reports an invalid pattern")
+        .Given(MemoryNode("memory"))
+        .Given(Objects({"some_key"}).Size(1_KB).CompleteOn("memory"))
+        .Then(MatchingKeyNames("^[unclosed")
+                  .ExpectError(ErrorCode::INVALID_PARAMS));
+}
+
+TEST(MasterServiceTest, GetKeysByRegexSelectsOnePathPerPrefix) {
+    // The manifest-less weight control plane lists models by matching exactly
+    // one well-known file per model, so chunk keys under the same prefix must
+    // not leak into the result.
+    MasterScenario("get keys by regex isolates one file per prefix")
+        .Given(MemoryNode("memory"))
+        .Given(Objects({"weight/models/qwen3/files/config.json",
+                        "weight/models/qwen3/files/model-00001.st/chunks/00000",
+                        "weight/models/qwen3/files/model-00001.st/chunks/00001",
+                        "weight/models/deepseek/files/config.json",
+                        "weight/models/deepseek/files/model-00001.st/chunks/0",
+                        "kvcache/deadbeef", "other/ns/config.json"})
+                   .Size(1_KB)
+                   .CompleteOn("memory"))
+        .Then(MatchingKeyNames("^weight/models/[^/]+/files/config\\.json$")
+                  .HasCount(2)
+                  .HasKeys({"weight/models/qwen3/files/config.json",
+                            "weight/models/deepseek/files/config.json"})
+                  .LacksKeys({"other/ns/config.json", "kvcache/deadbeef"}))
+        // Checkpoint-scoped prefix, as used by the import guard.
+        .Then(MatchingKeyNames("^weight/models/qwen3/").HasCount(3))
+        .Then(MatchingKeyNames("^weight/models/absent/").HasCount(0));
+}
+
 TEST(MasterServiceTest, RemoveByRegex) {
     const auto name = [](size_t index) {
         return "test_key" + std::to_string(index);

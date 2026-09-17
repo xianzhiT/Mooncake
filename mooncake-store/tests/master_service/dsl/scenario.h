@@ -2070,6 +2070,43 @@ struct MatchingKeysSpec {
 
 MatchingKeysSpec MatchingKeys(std::string pattern);
 
+// Name-only counterpart of MatchingKeys, asserting on GetKeysByRegex.
+struct MatchingKeyNamesSpec {
+    std::string pattern;
+    std::string tenant{TenantId::Default().value()};
+    std::optional<size_t> expected_count{};
+    std::vector<std::string> expected_keys;
+    std::vector<std::string> unexpected_keys;
+    std::optional<ErrorCode> expected_error{};
+
+    MatchingKeyNamesSpec& ForTenant(std::string value) {
+        tenant = std::move(value);
+        return *this;
+    }
+
+    MatchingKeyNamesSpec& HasCount(size_t value) {
+        expected_count = value;
+        return *this;
+    }
+
+    MatchingKeyNamesSpec& HasKeys(std::initializer_list<std::string> values) {
+        expected_keys.assign(values.begin(), values.end());
+        return *this;
+    }
+
+    MatchingKeyNamesSpec& LacksKeys(std::initializer_list<std::string> values) {
+        unexpected_keys.assign(values.begin(), values.end());
+        return *this;
+    }
+
+    MatchingKeyNamesSpec& ExpectError(ErrorCode value) {
+        expected_error = value;
+        return *this;
+    }
+};
+
+MatchingKeyNamesSpec MatchingKeyNames(std::string pattern);
+
 struct ClientIpsSpec {
     std::vector<std::string> actors;
     std::unordered_map<std::string, std::vector<std::string>> expected;
@@ -2210,6 +2247,7 @@ class MasterScenario {
     MasterScenario& Then(NamedTaskSpec task);
     MasterScenario& Then(UnknownTaskSpec task);
     MasterScenario& Then(MatchingKeysSpec matching_keys);
+    MasterScenario& Then(MatchingKeyNamesSpec matching_key_names);
     MasterScenario& Then(ClientIpsSpec client_ips);
     MasterScenario& Then(MemoryNodeStatusSpec node_status);
 

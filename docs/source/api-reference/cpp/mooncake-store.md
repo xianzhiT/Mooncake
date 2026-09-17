@@ -215,6 +215,19 @@ QueryByRegex(const std::string& str);
 
 Used to query the replica information for all objects whose keys match the given regular expression. This is useful for batch operations or for retrieving a group of related objects. The operation is performed on the Master and returns a map of keys to their replica lists.
 
+### QueryKeysByRegex
+
+```C++
+tl::expected<std::vector<std::string>, ErrorCode>
+QueryKeysByRegex(const std::string& str);
+```
+
+Name-only counterpart of `QueryByRegex`: returns just the keys whose names match the given regular expression, without their replica descriptors. Use it when the caller only needs to know which objects exist — listing or enumerating — so that responses stay small.
+
+Unlike `QueryByRegex`, this does **not** grant a read lease on the matched objects: listing an object is not using it, so it does not extend its lifetime.
+
+Matching happens on the Master, so only matching keys cross the wire. Complexity is O(total keys in the store), because object metadata is hash-sharded and keys sharing a prefix are spread across all shards. Prefer it for management and listing commands rather than hot paths; to test specific keys, use `BatchIsExist`.
+
 ### RemoveByRegex
 
 ```C++

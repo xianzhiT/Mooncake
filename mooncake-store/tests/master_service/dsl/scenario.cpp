@@ -228,6 +228,12 @@ MatchingKeysSpec MatchingKeys(std::string pattern) {
     return keys;
 }
 
+MatchingKeyNamesSpec MatchingKeyNames(std::string pattern) {
+    MatchingKeyNamesSpec keys;
+    keys.pattern = std::move(pattern);
+    return keys;
+}
+
 ClientIpsSpec ClientIps(std::initializer_list<std::string> actors) {
     ClientIpsSpec ips;
     ips.actors.assign(actors.begin(), actors.end());
@@ -1994,6 +2000,37 @@ MasterScenario& MasterScenario::Then(UnknownTaskSpec task) {
         Fail("UnknownTask(" + task.name + ") failed with " +
              toString(result.error()) + "; expected " +
              toString(task.expected_error));
+    }
+    return *this;
+}
+
+MasterScenario& MasterScenario::Then(MatchingKeyNamesSpec spec) {
+    if (!EnsureService()) {
+        return *this;
+    }
+    const std::string label = "MatchingKeyNames(" + spec.pattern + ")";
+    const auto result =
+        service_->GetKeysByRegex(spec.pattern, TenantId(spec.tenant));
+    ValidateActionResult(label, spec.expected_error, result.has_value(),
+                         result ? ErrorCode::OK : result.error());
+    if (!result) {
+        return *this;
+    }
+    const auto& keys = result.value();
+    if (spec.expected_count.has_value() &&
+        keys.size() != *spec.expected_count) {
+        Fail(label + " returned " + std::to_string(keys.size()) +
+             "; expected " + std::to_string(*spec.expected_count));
+    }
+    for (const auto& key : spec.expected_keys) {
+        if (std::find(keys.begin(), keys.end(), key) == keys.end()) {
+            Fail(label + " is missing " + key);
+        }
+    }
+    for (const auto& key : spec.unexpected_keys) {
+        if (std::find(keys.begin(), keys.end(), key) != keys.end()) {
+            Fail(label + " unexpectedly contains " + key);
+        }
     }
     return *this;
 }

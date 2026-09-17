@@ -66,6 +66,7 @@ The `Client` class provides the primary interface for Mooncake Store operations:
 | `BatchQueryIp` | Discover network locations of storage nodes |
 | `BatchReplicaClear` | Batch clear replicas on specific segments |
 | `QueryByRegex` / `RemoveByRegex` | Query or delete objects matching a regex |
+| `QueryKeysByRegex` | List the key names matching a regex, without replica info |
 
 For full API signatures, parameter details, and usage examples, see the [Mooncake Store C++ API Reference](../../api-reference/cpp/mooncake-store.md).
 
