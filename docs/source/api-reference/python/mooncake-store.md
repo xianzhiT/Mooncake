@@ -1420,8 +1420,12 @@ def query_keys_by_regex(self, regex_pattern: str) -> list[str]
 - `regex_pattern` (str): The regular expression to match against object keys.
 
 **Returns:**
-- `list[str]`: The matching keys. An empty list if nothing matched, and also
-  an empty list on error (including an invalid pattern).
+- `list[str]`: The matching keys. An empty list means the query succeeded
+  with no matches.
+
+**Raises:**
+- `RuntimeError`: The store is uninitialized/closed, the pattern is invalid,
+  or the query fails. Callers must not treat these failures as an empty store.
 
 **Notes:**
 - Filtering happens on the master, so only matching keys cross the wire —

@@ -22,6 +22,7 @@ from .model_keyspace import (
 )
 from .weight_cache import (
     DEFAULT_FILE_CHUNK_SIZE,
+    CheckpointBusyError,
     CheckpointExistsError,
     CheckpointNotFoundError,
     CheckpointStatus,
@@ -35,6 +36,7 @@ __all__ = [
     "CONFIG_FILE",
     "DEFAULT_FILE_CHUNK_SIZE",
     "SAFETENSORS_INDEX_FILE",
+    "CheckpointBusyError",
     "CheckpointExistsError",
     "CheckpointNotFoundError",
     "CheckpointStatus",

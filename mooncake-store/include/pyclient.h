@@ -400,9 +400,9 @@ class PyClient {
 
     /**
      * @brief Query the keys matching a regex pattern.
-     * @return Matching keys, or an empty vector on error.
+     * @return Matching keys on success, or an error. Empty means no matches.
      */
-    virtual std::vector<std::string> queryKeysByRegex(
+    virtual tl::expected<std::vector<std::string>, ErrorCode> queryKeysByRegex(
         const std::string &str) = 0;
 
     virtual long removeAll(bool force = false) = 0;

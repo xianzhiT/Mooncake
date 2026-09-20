@@ -1,32 +1,25 @@
-"""Manifest-less weight file cache on top of Mooncake Store.
+"""Safetensors weight file management on top of Mooncake Store.
 
-The store holds bytes only. It records nothing about what a model is, and
-there is no manifest, no status field, no registry of model names, and no
-lock. Everything a reader needs is either computable from the checkpoint id
-(see model_keyspace) or carried by the model's own files: config.json, the
-safetensors index, and each shard's self-describing header.
+Only file bytes live in Store. Layouts are derived from the original index
+and shard headers. Completeness is an observation of weight availability,
+not a serving-readiness guarantee or a checksum against the source.
 
-Consequences worth stating plainly:
-
-* Completeness is decided by checking the keys that should exist, right now.
-  Nothing claims a model is ready, so nothing can claim it while its chunks
-  are gone -- which happens routinely, since the store is volatile memory and
-  a restarted node loses its chunks.
-* Concurrent imports of the same checkpoint write identical bytes to
-  identical keys, so they cannot corrupt each other, and a reader mid-import
-  simply sees an incomplete model.
-* Re-importing a *changed* checkpoint under the same id is refused, because
-  the store's put is write-once and would silently keep the old bytes. Delete
-  first, or pass force=True.
+All writers must run on one management host with the same lock directory.
+Import and delete take a per-checkpoint OS file lock; readers remain unlocked.
+Use a new checkpoint id for new content. Failed imports leave partial data
+for explicit deletion, never roll back keys that another operation may use.
 """
 
 from __future__ import annotations
 
+import fcntl
 import os
 import sys
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, List, Optional
 
 from . import safetensors_header
 from .model_keyspace import (
@@ -47,13 +40,17 @@ from .model_keyspace import (
 )
 
 DEFAULT_FILE_CHUNK_SIZE = 64 * 1024 * 1024
-# store.remove returns this for an object that is already gone; tolerated so
-# that re-running a partial delete stays idempotent.
+DEFAULT_MANAGEMENT_LOCK_DIR = "/tmp/mooncake-weight-store-locks"
+# Native get_size returns this for a missing object.
 MISSING_OBJECT_ERROR = -704
 
 
 class WeightStoreError(RuntimeError):
     """Base class for control-plane failures."""
+
+
+class CheckpointBusyError(WeightStoreError):
+    """Another management operation holds this checkpoint's local file lock."""
 
 
 class CheckpointExistsError(WeightStoreError):
@@ -72,7 +69,7 @@ class CheckpointNotFoundError(WeightStoreError):
 class IncompleteCheckpointError(WeightStoreError):
     """Some of the checkpoint's chunks are missing from the store."""
 
-    def __init__(self, checkpoint_id: str, missing_keys: List[str]) -> None:
+    def __init__(self, checkpoint_id: str, missing_keys: list[str]) -> None:
         self.checkpoint_id = checkpoint_id
         self.missing_keys = missing_keys
         shown = ", ".join(missing_keys[:3])
@@ -91,16 +88,21 @@ class FileLayout:
     path: str
     size: int
     chunked: bool
-    keys: List[str]
+    keys: list[str]
 
 
 @dataclass
 class CheckpointStatus:
-    """What the store actually holds for a checkpoint, right now."""
+    """Observed weight availability, including config/index bootstrap files.
+
+    Does not cover tokenizer/processor files, model startup, content hashes,
+    or guarantee that objects remain available after inspection. If a header
+    is missing, its shard size is unknown and total_size is a lower bound.
+    """
 
     checkpoint_id: str
-    files: List[FileLayout] = field(default_factory=list)
-    missing_keys: List[str] = field(default_factory=list)
+    files: list[FileLayout] = field(default_factory=list)
+    missing_keys: list[str] = field(default_factory=list)
 
     @property
     def complete(self) -> bool:
@@ -136,15 +138,15 @@ class WeightCacheClient:
         store,
         *,
         replica_num: int = 1,
-        file_chunk_size: int = DEFAULT_FILE_CHUNK_SIZE,
         hard_pin_weights: bool = True,
         progress: bool = True,
+        management_lock_dir: str | os.PathLike[str] = DEFAULT_MANAGEMENT_LOCK_DIR,
     ) -> None:
-        if file_chunk_size <= 0:
-            raise ValueError(f"invalid file_chunk_size: {file_chunk_size!r}")
+        if replica_num <= 0:
+            raise ValueError(f"invalid replica_num: {replica_num!r}")
         self.store = store
         self.replica_num = replica_num
-        self.file_chunk_size = file_chunk_size
+        self.management_lock_dir = Path(management_lock_dir)
         self.hard_pin_weights = hard_pin_weights
         self.progress = progress
 
@@ -154,8 +156,6 @@ class WeightCacheClient:
         self,
         checkpoint_id: str,
         source: str | os.PathLike[str],
-        *,
-        force: bool = False,
     ) -> CheckpointStatus:
         """Mirror a model directory into the store.
 
@@ -164,60 +164,34 @@ class WeightCacheClient:
         has no safetensors index is stored without one, exactly as on disk.
         """
         validate_checkpoint_id(checkpoint_id)
-        source_dir = Path(source)
-        if not source_dir.is_dir():
-            raise WeightStoreError(f"source is not a directory: {source_dir}")
-
-        relative_paths = _list_model_files(source_dir)
-        if not relative_paths:
-            raise WeightStoreError(f"no files found under {source_dir}")
-        if CONFIG_FILE not in relative_paths:
-            # Without it a reader cannot bootstrap, and `list` cannot see the
-            # model at all, since config.json is the listing marker.
-            raise WeightStoreError(
-                f"{source_dir} has no {CONFIG_FILE}; "
-                "it does not look like a HuggingFace model directory"
+        with self._management_lock(checkpoint_id):
+            source_dir = Path(source)
+            relative_paths = self._validate_source(source_dir)
+            existing = self.store.query_keys_by_regex(
+                model_prefix_pattern(checkpoint_id)
             )
-
-        existing = self.store.query_keys_by_regex(model_prefix_pattern(checkpoint_id))
-        if existing:
-            if not force:
+            if existing:
                 raise CheckpointExistsError(
-                    f"checkpoint {checkpoint_id!r} already has "
-                    f"{len(existing)} object(s) in the store. Delete it first, "
-                    "or pass force=True: put is write-once, so importing over "
-                    "them would keep the old bytes and still report success."
+                    f"checkpoint {checkpoint_id!r} already has {len(existing)} object(s). "
+                    "Use a new id for new content; explicitly delete partial imports "
+                    "before retrying. Store put does not overwrite existing objects."
                 )
-            self._log(f"force: clearing {len(existing)} existing object(s)")
-            self.delete_model(checkpoint_id)
-
-        written: List[str] = []
-        try:
             for index, relative_path in enumerate(relative_paths, start=1):
                 layout = self._put_file(
-                    checkpoint_id,
-                    source_dir / relative_path,
-                    relative_path,
-                    written,
+                    checkpoint_id, source_dir / relative_path, relative_path
                 )
                 self._log(
                     f"[{index}/{len(relative_paths)}] {relative_path} "
-                    f"({_format_bytes(layout.size)}, "
-                    f"{len(layout.keys)} object(s))"
+                    f"({_format_bytes(layout.size)}, {len(layout.keys)} object(s))"
                 )
-        except BaseException:
-            # Leftover chunks would not make an incomplete model look ready --
-            # readers check every key -- but they would waste memory and block
-            # a later import, so clear them.
-            self._log("import failed; removing objects written so far")
-            self._remove_keys(written)
-            raise
-
-        return self.inspect_model(checkpoint_id)
+            status = self.inspect_model(checkpoint_id)
+            if not status.complete:
+                raise IncompleteCheckpointError(checkpoint_id, status.missing_keys)
+            return status
 
     # ------------------------------------------------------------- inspect
 
-    def list_models(self) -> List[str]:
+    def list_models(self) -> list[str]:
         """Checkpoint ids present in the store.
 
         Matches one well-known key per model (config.json) rather than
@@ -236,7 +210,7 @@ class WeightCacheClient:
         """
         validate_checkpoint_id(checkpoint_id)
         layouts = self._derive_layouts(checkpoint_id)
-        expected: List[str] = []
+        expected: list[str] = []
         for layout in layouts:
             expected.extend(layout.keys)
         missing = self._missing_keys(expected)
@@ -247,11 +221,11 @@ class WeightCacheClient:
         )
 
     def verify_model(self, checkpoint_id: str) -> CheckpointStatus:
-        """Read every byte back and confirm each shard parses.
+        """Read weight/bootstrap bytes back and check chunk lengths.
 
         Stronger than inspect_model, which only checks that keys exist. No
         stored checksum is compared, because none is stored; instead each
-        safetensors shard is re-parsed and its declared size checked against
+        safetensors header is parsed and its declared size checked against
         the bytes actually present, which catches truncation and corruption of
         the header region.
         """
@@ -260,19 +234,10 @@ class WeightCacheClient:
             raise IncompleteCheckpointError(checkpoint_id, status.missing_keys)
 
         for layout in status.files:
-            payload = self._read_keys(layout.keys)
-            if len(payload) != layout.size:
-                raise WeightStoreError(
-                    f"{layout.path}: expected {layout.size} bytes, "
-                    f"read {len(payload)}"
-                )
-            if layout.path.endswith(".safetensors"):
-                declared = safetensors_header.total_size(payload)
-                if declared != len(payload):
-                    raise WeightStoreError(
-                        f"{layout.path}: header declares {declared} bytes, "
-                        f"store holds {len(payload)}"
-                    )
+            # Stream one chunk at a time rather than duplicating a whole shard
+            # in memory. inspect_model already parsed the shard's header.
+            for _ in self._read_layout(checkpoint_id, layout):
+                pass
             self._log(f"verified {layout.path} ({_format_bytes(layout.size)})")
         return status
 
@@ -291,13 +256,16 @@ class WeightCacheClient:
         not eviction, so a reader's lease must not veto it.
         """
         validate_checkpoint_id(checkpoint_id)
-        removed = self._remove_by_regex(model_prefix_pattern(checkpoint_id))
-        if removed < 0:
-            raise WeightStoreError(
-                f"failed to delete checkpoint {checkpoint_id!r}: {removed}"
+        with self._management_lock(checkpoint_id):
+            removed = self.store.remove_by_regex(
+                model_prefix_pattern(checkpoint_id), True
             )
-        self._log(f"removed {removed} object(s)")
-        return int(removed)
+            if removed < 0:
+                raise WeightStoreError(
+                    f"failed to delete checkpoint {checkpoint_id!r}: {removed}"
+                )
+            self._log(f"removed {removed} object(s)")
+            return int(removed)
 
     # ---------------------------------------------------------- materialize
 
@@ -321,11 +289,21 @@ class WeightCacheClient:
                 f"{checkpoint_id}/{relative_path} is not in the store"
             )
         layout = self._layout_for(checkpoint_id, relative_path, size)
-        payload = self._read_keys(layout.keys)
         destination = Path(output_path)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(payload)
-        return len(payload)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=destination.parent, delete=False
+            ) as handle:
+                temporary = Path(handle.name)
+                for part in self._read_layout(checkpoint_id, layout):
+                    handle.write(part)
+            os.replace(temporary, destination)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        return size
 
     def read_file(self, checkpoint_id: str, relative_path: str) -> bytes:
         """Read one stored file into memory."""
@@ -337,11 +315,11 @@ class WeightCacheClient:
                 f"{checkpoint_id}/{relative_path} is not in the store"
             )
         layout = self._layout_for(checkpoint_id, relative_path, size)
-        return self._read_keys(layout.keys)
+        return b"".join(self._read_layout(checkpoint_id, layout))
 
     # ------------------------------------------------------------ internals
 
-    def _derive_layouts(self, checkpoint_id: str) -> List[FileLayout]:
+    def _derive_layouts(self, checkpoint_id: str) -> list[FileLayout]:
         """Work out which files a checkpoint should have, and their keys.
 
         Reads the model's own metadata rather than a stored description:
@@ -351,8 +329,7 @@ class WeightCacheClient:
         config = self._get_optional(model_config_key(checkpoint_id))
         if config is None:
             raise CheckpointNotFoundError(
-                f"checkpoint {checkpoint_id!r} is not in the store "
-                f"(no {CONFIG_FILE})"
+                f"checkpoint {checkpoint_id!r} is not in the store (no {CONFIG_FILE})"
             )
 
         layouts = [
@@ -381,7 +358,13 @@ class WeightCacheClient:
             shard_names = safetensors_header.weight_map_files(index_payload)
 
         for shard in shard_names:
-            size = self._weight_shard_size(checkpoint_id, shard)
+            try:
+                size = self._weight_shard_size(checkpoint_id, shard)
+            except IncompleteCheckpointError as exc:
+                layouts.append(
+                    FileLayout(path=shard, size=0, chunked=True, keys=exc.missing_keys)
+                )
+                continue
             if size is None:
                 # Name the first chunk as the missing key, so the caller sees
                 # which shard is gone rather than a bare "not found".
@@ -401,7 +384,7 @@ class WeightCacheClient:
         self, checkpoint_id: str, relative_path: str, size: int
     ) -> FileLayout:
         if is_weight_file(relative_path):
-            count = chunk_count_for_size(size, self.file_chunk_size)
+            count = chunk_count_for_size(size, DEFAULT_FILE_CHUNK_SIZE)
             return FileLayout(
                 path=relative_path,
                 size=size,
@@ -415,39 +398,34 @@ class WeightCacheClient:
             keys=[model_file_key(checkpoint_id, relative_path)],
         )
 
-    def _weight_shard_size(
-        self, checkpoint_id: str, relative_path: str
-    ) -> Optional[int]:
+    def _weight_shard_size(self, checkpoint_id: str, relative_path: str) -> int | None:
         """Size of a stored shard, read from its own header.
 
-        Fetches only the first chunk: a safetensors header is far smaller than
-        one chunk, so the total size is derivable without reading the shard.
+        Fetches the first chunk and, for large headers, subsequent chunks.
+        The header declares the total size without reading the tensor payload.
         """
-        first_chunk = self._get_optional(
+        _require_safetensors(relative_path)
+        prefix = self._get_optional(
             model_file_chunk_key(checkpoint_id, relative_path, 0)
         )
-        if first_chunk is None:
+        if prefix is None:
             return None
-        if not relative_path.endswith(".safetensors"):
-            # Other chunked formats are not self-describing, so the count can
-            # only come from the chunks present. A hole would be invisible
-            # here; safetensors is the supported path.
-            return self._probe_chunked_size(checkpoint_id, relative_path)
-        return safetensors_header.total_size(first_chunk)
-
-    def _probe_chunked_size(self, checkpoint_id: str, relative_path: str) -> int:
-        size = 0
-        index = 0
-        while True:
-            chunk = self._get_optional(
-                model_file_chunk_key(checkpoint_id, relative_path, index)
-            )
-            if chunk is None:
-                return size
-            size += len(chunk)
+        header_end = 8 + safetensors_header.header_length(prefix)
+        # A valid header may span more than one chunk. Its length, never a
+        # missing key, determines where to stop reading.
+        index = 1
+        while len(prefix) < header_end:
+            if len(prefix) != index * DEFAULT_FILE_CHUNK_SIZE:
+                raise WeightStoreError(f"{relative_path}: truncated header chunk")
+            key = model_file_chunk_key(checkpoint_id, relative_path, index)
+            part = self._get_optional(key)
+            if part is None:
+                raise IncompleteCheckpointError(checkpoint_id, [key])
+            prefix += part
             index += 1
+        return safetensors_header.total_size(prefix)
 
-    def _file_size(self, checkpoint_id: str, relative_path: str) -> Optional[int]:
+    def _file_size(self, checkpoint_id: str, relative_path: str) -> int | None:
         if is_weight_file(relative_path):
             return self._weight_shard_size(checkpoint_id, relative_path)
         payload = self._get_optional(model_file_key(checkpoint_id, relative_path))
@@ -458,34 +436,26 @@ class WeightCacheClient:
         checkpoint_id: str,
         source_path: Path,
         relative_path: str,
-        written: List[str],
     ) -> FileLayout:
-        """Store one file, appending each key to ``written`` as it lands.
-
-        ``written`` is updated per key rather than per file so that a failure
-        partway through a large shard still leaves the caller able to clean up
-        the chunks that did land.
-        """
+        """Store one source file using the fixed chunk layout."""
         size = source_path.stat().st_size
         if not is_weight_file(relative_path):
             payload = source_path.read_bytes()
             key = model_file_key(checkpoint_id, relative_path)
             self._put(key, payload, self._config(chunked=False))
-            written.append(key)
             return FileLayout(path=relative_path, size=size, chunked=False, keys=[key])
 
         config = self._config(chunked=True)
-        keys: List[str] = []
+        keys: list[str] = []
         total = 0
         with source_path.open("rb") as handle:
-            for index in range(chunk_count_for_size(size, self.file_chunk_size)):
-                chunk = handle.read(self.file_chunk_size)
+            for index in range(chunk_count_for_size(size, DEFAULT_FILE_CHUNK_SIZE)):
+                chunk = handle.read(DEFAULT_FILE_CHUNK_SIZE)
                 key = model_file_chunk_key(checkpoint_id, relative_path, index)
                 self._put(key, chunk, config)
-                written.append(key)
                 keys.append(key)
                 total += len(chunk)
-        if total != size:
+        if total != size or source_path.stat().st_size != size:
             raise WeightStoreError(
                 f"{relative_path}: read {total} bytes, expected {size}; "
                 "the file changed during import"
@@ -533,33 +503,36 @@ class WeightCacheClient:
         if result not in (0, None):
             raise WeightStoreError(f"failed to put {key}: {result}")
 
-    def _remove_by_regex(self, pattern: str) -> int:
-        """Remove matching keys, ignoring read leases (see delete_model)."""
-        try:
-            removed = self.store.remove_by_regex(pattern, True)
-        except TypeError:
-            # A store (or test double) without the force parameter.
-            removed = self.store.remove_by_regex(pattern)
-        return 0 if removed is None else int(removed)
-
-    def _get_optional(self, key: str) -> Optional[bytes]:
+    def _get_optional(self, key: str) -> bytes | None:
         value = self.store.get(key)
-        if value is None:
+        if value:
+            return bytes(value)
+        # Native get returns b"" for both failure and an empty object. Only a
+        # missing-object result from metadata permits treating it as absent.
+        size = self.store.get_size(key)
+        if size == MISSING_OBJECT_ERROR:
             return None
-        if isinstance(value, str):
-            return value.encode("utf-8")
-        return bytes(value)
+        if size == 0 and value is not None:
+            return b""
+        raise WeightStoreError(f"failed to read {key}: get_size returned {size}")
 
-    def _read_keys(self, keys: Iterable[str]) -> bytes:
-        parts: List[bytes] = []
-        for key in keys:
+    def _read_layout(self, checkpoint_id: str, layout: FileLayout) -> Iterator[bytes]:
+        remaining = layout.size
+        for key in layout.keys:
             value = self._get_optional(key)
             if value is None:
-                raise IncompleteCheckpointError("", [key])
-            parts.append(value)
-        return b"".join(parts)
+                raise IncompleteCheckpointError(checkpoint_id, [key])
+            expected = (
+                min(remaining, DEFAULT_FILE_CHUNK_SIZE) if layout.chunked else remaining
+            )
+            if len(value) != expected:
+                raise WeightStoreError(
+                    f"{layout.path}: expected {expected} bytes in {key}, read {len(value)}"
+                )
+            remaining -= len(value)
+            yield value
 
-    def _missing_keys(self, keys: List[str]) -> List[str]:
+    def _missing_keys(self, keys: list[str]) -> list[str]:
         if not keys:
             return []
         batch = getattr(self.store, "batch_is_exist", None)
@@ -568,10 +541,9 @@ class WeightCacheClient:
         results = batch(list(keys))
         if len(results) != len(keys):
             raise WeightStoreError(
-                f"batch_is_exist returned {len(results)} results "
-                f"for {len(keys)} keys"
+                f"batch_is_exist returned {len(results)} results for {len(keys)} keys"
             )
-        missing: List[str] = []
+        missing: list[str] = []
         for key, result in zip(keys, results):
             if result < 0:
                 raise WeightStoreError(f"failed to check {key}: {result}")
@@ -582,31 +554,74 @@ class WeightCacheClient:
     def _exists(self, key: str) -> bool:
         checker = getattr(self.store, "is_exist", None)
         if checker is None:
-            return self.store.get(key) is not None
+            return self._get_optional(key) is not None
         result = checker(key)
         if result < 0:
             raise WeightStoreError(f"failed to check {key}: {result}")
         return bool(result)
 
-    def _remove_keys(self, keys: Iterable[str]) -> None:
-        for key in keys:
+    @contextmanager
+    def _management_lock(self, checkpoint_id: str):
+        """Cooperative, nonblocking lock on one management host.
+
+        Never unlink lock files: waiters and new callers must lock the same
+        inode. All managers must share this directory and filesystem namespace.
+        This does not coordinate writers on different hosts or raw Store puts.
+        """
+        self.management_lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with (self.management_lock_dir / checkpoint_id).open("a") as handle:
             try:
-                result = self.store.remove(key, True)
-            except TypeError:
-                result = self.store.remove(key)
-            except BaseException:
-                continue
-            if result not in (0, None, MISSING_OBJECT_ERROR):
-                self._log(f"warning: failed to remove {key}: {result}")
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise CheckpointBusyError(
+                    f"checkpoint {checkpoint_id!r} has an active management operation"
+                ) from exc
+            # Closing the descriptor releases the lock, including on exceptions.
+            yield
+
+    def _validate_source(self, source_dir: Path) -> list[str]:
+        if not source_dir.is_dir():
+            raise WeightStoreError(f"source is not a directory: {source_dir}")
+        paths = _list_model_files(source_dir)
+        if CONFIG_FILE not in paths:
+            raise WeightStoreError(f"{source_dir} has no {CONFIG_FILE}")
+        shards = {path for path in paths if is_weight_file(path)}
+        for path in shards:
+            _require_safetensors(path)
+        if SAFETENSORS_INDEX_FILE in paths:
+            expected = set(
+                safetensors_header.weight_map_files(
+                    (source_dir / SAFETENSORS_INDEX_FILE).read_bytes()
+                )
+            )
+        else:
+            expected = {"model.safetensors"}
+        if shards != expected:
+            raise WeightStoreError(
+                "safetensors files must match the index, or consist of model.safetensors "
+                f"without an index; missing={sorted(expected - shards)}, "
+                f"unlisted={sorted(shards - expected)}"
+            )
+        for shard in sorted(shards):
+            path = source_dir / shard
+            with path.open("rb") as handle:
+                prefix = handle.read(8)
+                length = safetensors_header.header_length(prefix)
+                declared = safetensors_header.total_size(prefix + handle.read(length))
+            if declared != path.stat().st_size:
+                raise WeightStoreError(
+                    f"{shard}: source size does not match its header"
+                )
+        return paths
 
     def _log(self, message: str) -> None:
         if self.progress:
             print(message, file=sys.stderr, flush=True)
 
 
-def _list_model_files(source_dir: Path) -> List[str]:
+def _list_model_files(source_dir: Path) -> list[str]:
     """Relative paths of every regular file under a model directory, sorted."""
-    paths: List[str] = []
+    paths: list[str] = []
     for path in sorted(source_dir.rglob("*")):
         if not path.is_file():
             continue
@@ -630,3 +645,11 @@ def _format_bytes(value: float) -> str:
             return f"{value:.1f}{unit}" if unit != "B" else f"{int(value)}B"
         value /= 1024
     return f"{value:.1f}TiB"
+
+
+def _require_safetensors(path: str) -> None:
+    validate_relative_path(path)
+    if not path.endswith(".safetensors"):
+        raise WeightStoreError(
+            f"unsupported weight format: {path}; only safetensors is supported"
+        )

@@ -165,7 +165,8 @@ class DummyClient : public PyClient {
 
     long removeByRegex(const std::string &str, bool force = false);
 
-    std::vector<std::string> queryKeysByRegex(const std::string &str);
+    tl::expected<std::vector<std::string>, ErrorCode> queryKeysByRegex(
+        const std::string &str);
 
     long removeAll(bool force = false);
 

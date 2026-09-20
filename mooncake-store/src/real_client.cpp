@@ -2404,12 +2404,9 @@ RealClient::queryKeysByRegex_internal(const std::string &str) {
     return client_->QueryKeysByRegex(str);
 }
 
-std::vector<std::string> RealClient::queryKeysByRegex(const std::string &str) {
-    auto result = queryKeysByRegex_internal(str);
-    if (!result) {
-        return {};
-    }
-    return std::move(result.value());
+tl::expected<std::vector<std::string>, ErrorCode> RealClient::queryKeysByRegex(
+    const std::string &str) {
+    return queryKeysByRegex_internal(str);
 }
 
 tl::expected<int64_t, ErrorCode> RealClient::removeAll_internal(bool force) {

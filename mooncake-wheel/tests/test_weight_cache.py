@@ -5,6 +5,7 @@ The fake store below enforces the two store behaviours the design depends on:
 * put is write-once -- a second put to an existing key reports success and
   discards the new bytes. Anything that assumes overwriting works must fail
   here rather than in production.
+* get returns b"" for a missing object; get_size reports -704.
 * regex queries and removals are server-side, matching against the full key.
 """
 
@@ -16,7 +17,6 @@ import struct
 from pathlib import Path
 
 import pytest
-
 from mooncake.weight_store import (
     CheckpointExistsError,
     CheckpointNotFoundError,
@@ -28,9 +28,11 @@ from mooncake.weight_store import (
     model_config_key,
     model_file_chunk_key,
     model_file_key,
+    model_keyspace,
     model_safetensors_index_key,
+    safetensors_header,
+    weight_cache,
 )
-from mooncake.weight_store import model_keyspace, safetensors_header
 
 
 class FakeReplicateConfig:
@@ -70,7 +72,10 @@ class WriteOnceStore:
     def get(self, key: str):
         if key in self.data:
             self.leased.add(key)
-        return self.data.get(key)
+        return self.data.get(key, b"")
+
+    def get_size(self, key: str) -> int:
+        return len(self.data[key]) if key in self.data else -704
 
     def is_exist(self, key: str) -> int:
         return 1 if key in self.data else 0
@@ -157,14 +162,23 @@ def write_model(
     return root
 
 
+@pytest.fixture(autouse=True)
+def small_protocol_chunks(monkeypatch):
+    # Keep hole/truncation tests small. Production chunk size is fixed; the
+    # native integration suite separately exercises the actual 64 MiB layout.
+    monkeypatch.setattr(weight_cache, "DEFAULT_FILE_CHUNK_SIZE", 1024)
+
+
 @pytest.fixture
 def store() -> WriteOnceStore:
     return WriteOnceStore()
 
 
 @pytest.fixture
-def client(store: WriteOnceStore) -> WeightCacheClient:
-    return WeightCacheClient(store, file_chunk_size=1024, progress=False)
+def client(store: WriteOnceStore, tmp_path: Path) -> WeightCacheClient:
+    return WeightCacheClient(
+        store, progress=False, management_lock_dir=tmp_path / "locks"
+    )
 
 
 @pytest.fixture
@@ -314,7 +328,7 @@ def test_import_rejects_a_directory_without_config(
         client.import_model("m", bare)
 
 
-def test_import_cleans_up_after_a_failure(
+def test_import_leaves_partial_data_after_a_failure(
     client: WeightCacheClient, store: WriteOnceStore, model_dir: Path, monkeypatch
 ):
     calls = {"n": 0}
@@ -329,6 +343,8 @@ def test_import_cleans_up_after_a_failure(
     monkeypatch.setattr(store, "put", failing_put)
     with pytest.raises(RuntimeError, match="store died"):
         client.import_model("m", model_dir)
+    assert store.data
+    client.delete_model("m")
     assert store.data == {}
 
 
@@ -363,26 +379,6 @@ def test_refusal_prevents_silently_serving_stale_weights(
     assert store.discarded_puts == []
 
 
-def test_force_replaces_an_existing_checkpoint(
-    client: WeightCacheClient, store: WriteOnceStore, tmp_path: Path
-):
-    first = write_model(
-        tmp_path / "v1", shards={"model-00001-of-00001.safetensors": {"a": 512}}
-    )
-    client.import_model("m", first)
-
-    second = write_model(
-        tmp_path / "v2", shards={"model-00001-of-00001.safetensors": {"a": 4096}}
-    )
-    status = client.import_model("m", second, force=True)
-    assert status.complete
-    # The new bytes really landed: no put was discarded.
-    assert store.discarded_puts == []
-    shard = "model-00001-of-00001.safetensors"
-    stored = client.read_file("m", shard)
-    assert stored == (second / shard).read_bytes()
-
-
 def test_guard_catches_leftovers_from_an_interrupted_import(
     client: WeightCacheClient, store: WriteOnceStore, model_dir: Path
 ):
@@ -399,29 +395,13 @@ def test_guard_catches_leftovers_from_an_interrupted_import(
     orphan = model_file_chunk_key("m", shard, 0)
     stale_bytes = make_safetensors({"a": 64})
     store.put(orphan, stale_bytes)
-    assert store.get(model_config_key("m")) is None
+    assert store.get(model_config_key("m")) == b""
 
     with pytest.raises(CheckpointExistsError):
         client.import_model("m", model_dir)
     # Nothing was overwritten, so no put was silently discarded.
     assert store.discarded_puts == []
     assert store.get(orphan) == stale_bytes
-
-
-def test_concurrent_imports_of_the_same_bytes_do_not_corrupt_each_other(
-    store: WriteOnceStore, model_dir: Path
-):
-    """Two importers racing on one checkpoint is harmless.
-
-    Identical bytes go to identical keys, so whoever loses each put still
-    leaves the correct content behind. No lock needed.
-    """
-    first = WeightCacheClient(store, file_chunk_size=1024, progress=False)
-    second = WeightCacheClient(store, file_chunk_size=1024, progress=False)
-    first.import_model("m", model_dir)
-    second.import_model("m", model_dir, force=True)
-    status = second.verify_model("m")
-    assert status.complete
 
 
 # ------------------------------------------------------------------- listing
@@ -649,22 +629,18 @@ def test_delete_sweeps_orphans_from_an_interrupted_import(
     assert store.data == {}
 
 
-def test_delete_then_import_replaces_the_content(
+def test_delete_then_import_repairs_the_same_checkpoint(
     client: WeightCacheClient, store: WriteOnceStore, tmp_path: Path
 ):
-    first = write_model(
-        tmp_path / "v1", shards={"model-00001-of-00001.safetensors": {"a": 512}}
-    )
-    client.import_model("m", first)
+    source = write_model(tmp_path / "source")
+    client.import_model("m", source)
+    shard = "model-00001-of-00002.safetensors"
+    del store.data[model_file_chunk_key("m", shard, 1)]
+    assert not client.inspect_model("m").complete
     client.delete_model("m")
-
-    second = write_model(
-        tmp_path / "v2", shards={"model-00001-of-00001.safetensors": {"a": 4096}}
-    )
-    client.import_model("m", second)
+    assert client.import_model("m", source).complete
     assert store.discarded_puts == []
-    shard = "model-00001-of-00001.safetensors"
-    assert client.read_file("m", shard) == (second / shard).read_bytes()
+    assert client.read_file("m", shard) == (source / shard).read_bytes()
 
 
 # --------------------------------------------------------------- single file
@@ -731,24 +707,21 @@ def test_nested_files_are_preserved(client: WeightCacheClient, tmp_path: Path):
 
 
 def test_weight_shards_are_hard_pinned_and_typed(
-    store: WriteOnceStore, model_dir: Path
+    store: WriteOnceStore, model_dir: Path, tmp_path: Path
 ):
     client = WeightCacheClient(
-        store, file_chunk_size=1024, progress=False, hard_pin_weights=True
+        store,
+        progress=False,
+        hard_pin_weights=True,
+        management_lock_dir=tmp_path / "locks",
     )
     client.import_model("m", model_dir)
     chunk_key = model_file_chunk_key("m", "model-00001-of-00002.safetensors", 0)
     assert store.configs[chunk_key].with_hard_pin is True
 
 
-def test_client_works_without_batch_is_exist(store: WriteOnceStore, model_dir: Path):
+def test_client_works_without_batch_is_exist(client, store, model_dir, monkeypatch):
     """Existence checks fall back to per-key lookups if batching is absent."""
-    delattr(type(store), "batch_is_exist")
-    try:
-        client = WeightCacheClient(store, file_chunk_size=1024, progress=False)
-        client.import_model("m", model_dir)
-        assert client.inspect_model("m").complete
-    finally:
-        WriteOnceStore.batch_is_exist = lambda self, keys: [
-            1 if key in self.data else 0 for key in keys
-        ]
+    monkeypatch.setattr(store, "batch_is_exist", None)
+    client.import_model("m", model_dir)
+    assert client.inspect_model("m").complete

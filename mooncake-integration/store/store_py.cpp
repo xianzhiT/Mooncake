@@ -2528,14 +2528,22 @@ PYBIND11_MODULE(store, m) {
             "query_keys_by_regex",
             [](MooncakeStorePyWrapper &self, const std::string &str) {
                 py::gil_scoped_release release;
-                return self.store_->queryKeysByRegex(str);
+                if (!self.store_) {
+                    throw std::runtime_error(
+                        "query_keys_by_regex: store is not initialized");
+                }
+                auto result = self.store_->queryKeysByRegex(str);
+                if (!result) {
+                    throw std::runtime_error("query_keys_by_regex failed: " +
+                                             toString(result.error()));
+                }
+                return std::move(result.value());
             },
             py::arg("regex_pattern"),
-            "Returns the keys of objects in the store matching the given "
-            "regular expression. Server-side filtering, so only matching keys "
-            "cross the wire. Returns an empty list on error. Note this scans "
-            "all metadata shards (O(total keys)) and is intended for "
-            "management/listing commands, not hot paths.")
+            "Returns matching object keys, or raises RuntimeError on failure. "
+            "An empty list means the query succeeded with no matches. "
+            "Server-side filtering scans all metadata shards (O(total keys)); "
+            "intended for management/listing commands, not hot paths.")
         .def(
             "remove_all",
             [](MooncakeStorePyWrapper &self, bool force) {

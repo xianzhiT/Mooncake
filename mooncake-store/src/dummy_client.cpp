@@ -1274,13 +1274,10 @@ long DummyClient::removeByRegex(const std::string& str, bool force) {
         invoke_rpc<&RealClient::removeByRegex_internal, long>(str, force));
 }
 
-std::vector<std::string> DummyClient::queryKeysByRegex(const std::string& str) {
-    auto result = invoke_rpc<&RealClient::queryKeysByRegex_internal,
-                             std::vector<std::string>>(str);
-    if (!result) {
-        return {};
-    }
-    return std::move(result.value());
+tl::expected<std::vector<std::string>, ErrorCode> DummyClient::queryKeysByRegex(
+    const std::string& str) {
+    return invoke_rpc<&RealClient::queryKeysByRegex_internal,
+                      std::vector<std::string>>(str);
 }
 
 long DummyClient::removeAll(bool force) {
