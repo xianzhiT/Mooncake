@@ -48,6 +48,7 @@ Changelog = "https://github.com/kvcache-ai/Mooncake/releases"
 Slack = "https://join.slack.com/t/mooncake-project/shared_invite/zt-3qx4x35ea-zSSTqTHItHJs9SCoXLOSPA"
 
 [project.scripts]
+mooncake-weight = "mooncake.weight_store.cli:main"
 mooncake_master = "mooncake.cli:main"
 mooncake_client = "mooncake.cli_client:main"
 transfer_engine_bench = "mooncake.cli_bench:main"

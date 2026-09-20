@@ -56,6 +56,70 @@ model registry, or lock object is written to Store.
 
 ## Operations
 
+### Command line
+
+The wheel installs `mooncake-weight`. From a source checkout, use
+`PYTHONPATH=mooncake-wheel python -m mooncake.weight_store.cli` instead.
+Operations require the built `mooncake.store` extension; help is available
+without it.
+
+Save a connection configuration, for example `weight-store.json`:
+
+```json
+{
+  "master_server_address": "127.0.0.1:50051",
+  "local_hostname": "127.0.0.1:0",
+  "metadata_server": "P2PHANDSHAKE",
+  "protocol": "tcp",
+  "device_name": "",
+  "local_buffer_size": 134217728,
+  "replica_num": 1,
+  "management_lock_dir": "/var/lib/mooncake/weight-locks"
+}
+```
+
+Only `master_server_address` is required. The other defaults are shown above,
+except that the default lock directory is `/tmp/mooncake-weight-store-locks`.
+Use a reachable local interface instead of loopback for a remote cluster.
+`protocol` supports `tcp` and `rdma`; set the RDMA device and metadata service
+as appropriate for your cluster. Buffer sizes are bytes; the default local
+buffer is 128 MiB for the fixed 64 MiB weight chunks. Increase it if needed
+for large auxiliary files. Unknown configuration fields are rejected.
+
+The CLI always uses **zero global segment capacity**. Existing, long-lived
+Store nodes must provide sufficient storage for the requested replica count.
+The CLI process never hosts weights that would disappear when it exits.
+Hard pinning remains enabled. This does not make the in-memory Store durable.
+
+```bash
+export MOONCAKE_WEIGHT_CONFIG=/path/to/weight-store.json
+mooncake-weight import qwen-revision-a /models/qwen-revision-a
+mooncake-weight list
+mooncake-weight inspect qwen-revision-a
+mooncake-weight verify qwen-revision-a
+mooncake-weight inspect qwen-revision-a --json
+mooncake-weight delete qwen-revision-a
+```
+
+`--config FILE` overrides the environment variable. Both `--config` and
+`--json` can appear before or after the subcommand. Delete executes immediately
+without an interactive prompt and may interrupt readers; it is also the
+explicit cleanup operation for partial imports.
+
+Results go to stdout; errors and progress go to stderr. JSON mode suppresses
+Python progress messages, emits the status dictionary for import/inspect/verify,
+an array of checkpoint IDs for list, or `{checkpoint_id, removed_objects}` for
+delete. Operational errors emit `{error, message}` on stderr, with `missing_keys`
+when available. Native library diagnostics may also appear on stderr.
+
+Exit codes: **0** success, **1** operational/configuration error or incomplete
+inspection, **2** invalid command syntax, **130** keyboard interruption.
+Argument-parser errors and interruption messages remain plain text in JSON
+mode. An incomplete inspection still emits its status to stdout and exits 1.
+Neither inspect nor verify establishes content identity or serving readiness.
+
+### Python
+
 ```python
 from mooncake.weight_store import WeightCacheClient
 
@@ -98,8 +162,10 @@ health probe. No loading-performance claim is made by this module.
 
 ## Verification
 
-Run `test_weight_cache.py` and `test_weight_cache_contract.py` with pytest.
-The latter includes independent-process locking and process-death tests.
+Run `test_weight_cache.py`, `test_weight_cache_contract.py`, and
+`test_weight_cli.py` with pytest. The contract suite includes independent-process
+locking and process-death tests. The CLI suite covers configuration, output,
+exit codes, and command dispatch through the real weight manager.
 `test_weight_cache_native.py` provides opt-in tests against a dedicated TCP
 master and a freshly built `mooncake.store` extension:
 
@@ -114,3 +180,8 @@ exercise the production 64 MiB layout without requiring SGLang or a GPU.
 Set `MOONCAKE_WEIGHT_TEST_REAL_CLIENT=host:port` as well to run the native
 suite through a separately started `mooncake_client` service (DummyClient
 forwarding), using the same dedicated master.
+
+With the same `MOONCAKE_WEIGHT_TEST_MASTER` setting, the CLI suite also runs a
+native subprocess roundtrip: a long-lived storage client hosts the objects
+while separate CLI processes import, list, inspect, verify, and delete them.
+It checks that data survives the import process exiting.
